@@ -175,9 +175,10 @@ cd backend
 docker compose -f docker-compose.postgres.yml up -d
 
 # If host port 5432 is already taken (e.g. a locally-installed Postgres),
-# map the container to a free host port and point the backend at it:
-#   POSTGRES_HOST_PORT=5544 docker compose -f docker-compose.postgres.yml up -d
-#   POSTGRES_PORT=5544 python -m uvicorn app:app --port 8000
+# map the container to a free host port and point the backend at it.
+# On Windows this is the norm — see Windows Gotchas. Recommended: 5444.
+#   POSTGRES_HOST_PORT=5444 docker compose -f docker-compose.postgres.yml up -d
+#   then in backend/.env:  POSTGRES_HOST=127.0.0.1  and  POSTGRES_PORT=5444
 
 # Tables auto-create on backend startup. To init manually:
 python -c "from database import init_db; init_db()"
@@ -189,10 +190,11 @@ Place your GGUF model at `backend/models/barronllm.gguf`. Also requires `binarie
 #### 5. Start Backend
 ```bash
 cd backend
-python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+# Windows: port 8000 is reserved by Hyper-V — use 8080 (see Windows Gotchas).
+python -m uvicorn app:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-Server runs on `http://localhost:8000`. Health check: `GET /health`
+Server runs on `http://localhost:8080`. Health check: `GET /health`
 
 #### 6. Verify Services
 ```bash
@@ -200,7 +202,7 @@ Server runs on `http://localhost:8000`. Health check: `GET /health`
 bandit --version
 
 # Check code analyzer
-curl -X POST http://localhost:8000/analyze-code \
+curl -X POST http://localhost:8080/analyze-code \
   -H "Content-Type: application/json" \
   -d '{"code":"eval(x)","filename":"test.py"}'
 ```
@@ -222,8 +224,12 @@ npm install
 #### 2. Configure Vite Proxy
 File: `vite.config.js`
 - Frontend port: `5173`
-- Backend proxy: `/api/*` → `http://localhost:8000`
+- Backend proxy: `/api/*` → `http://localhost:8080`
 - **Note**: Current proxy configuration requires backend routes WITHOUT `/api` prefix (e.g., `/analyze-code`, `/chat`, `/execute`)
+- **Note**: Run vite from the repo root (`npm run dev`). The root `vite.config.js`
+  sets `root: 'frontend'`; the `frontend/vite.config.js` does NOT (it is used only
+  if you run vite from inside `frontend/`). Don't set `root: 'frontend'` in both —
+  that double-nests the path and serves a 404 on `/`.
 
 #### 3. Start Dev Server
 ```bash
@@ -328,9 +334,9 @@ TOOL_TIMEOUTS = {
 ### Terminal 1: Backend
 ```bash
 cd backend
-# Postgres must be up first (default localhost:5432)
-docker compose -f docker-compose.postgres.yml up -d
-python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+# Postgres must be up first. On Windows map to a free port (see Windows Gotchas).
+POSTGRES_HOST_PORT=5444 docker compose -f docker-compose.postgres.yml up -d
+python -m uvicorn app:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 > Or run the whole backend stack (Postgres + orchestrator) in containers:
@@ -349,8 +355,8 @@ docker-compose -f docker-compose.tools.yml up
 
 ### Access
 - **Frontend**: `http://localhost:5173`
-- **Backend API**: `http://localhost:8000`
-- **API Docs**: `http://localhost:8000/docs`
+- **Backend API**: `http://localhost:8080`
+- **API Docs**: `http://localhost:8080/docs`
 
 ---
 
@@ -567,8 +573,12 @@ status (pending/completed/failed)
 # Check Python version
 python --version  # Must be 3.9+
 
-# Check port in use
-lsof -i :8000
+# Check port in use (Linux/Mac)
+lsof -i :8080
+# Windows:
+netstat -ano | findstr ":8080"
+# "forbidden by access permissions" on 8000? It's Hyper-V-reserved — use 8080:
+netsh interface ipv4 show excludedportrange protocol=tcp
 
 # Rebuild dependencies
 pip install --upgrade --force-reinstall -r requirements.txt
@@ -611,7 +621,7 @@ docker run --rm <tool-image> --help
 ### Database Reset / Wipe
 ```bash
 # Wipe scan data + reports via the API (keeps tool definitions)
-curl -X POST http://localhost:8000/database/reset
+curl -X POST http://localhost:8080/database/reset
 
 # Or nuke the Postgres volume for a total clean slate, then restart
 cd backend
@@ -621,10 +631,15 @@ docker compose -f docker-compose.postgres.yml up -d
 
 ### Cannot connect to database
 ```bash
-# Confirm Postgres is up and listening on 5432
+# Confirm Postgres is up
 cd backend && docker compose -f docker-compose.postgres.yml ps
-# Check DATABASE_URL matches POSTGRES_* creds (default alphaweb/alphaweb)
+# Check DATABASE_URL / POSTGRES_* creds (default alphaweb/alphaweb)
 ```
+`password authentication failed for user "alphaweb"` on Windows usually means the
+backend hit a **native Postgres** instead of the container, or a **stale volume**
+holds old creds. See [Windows Gotchas](#windows-gotchas) — use `POSTGRES_HOST=127.0.0.1`,
+map the container to a free port (`POSTGRES_HOST_PORT=5444`), and `down -v` to reset
+a stale volume.
 
 ---
 
@@ -633,7 +648,7 @@ cd backend && docker compose -f docker-compose.postgres.yml ps
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ORCHESTRATOR_HOST` | 0.0.0.0 | FastAPI bind address |
-| `ORCHESTRATOR_PORT` | 8000 | FastAPI port |
+| `ORCHESTRATOR_PORT` | 8000 | FastAPI port (use 8080 on Windows — 8000 is Hyper-V-reserved) |
 | `BARONLLM_MODEL_PATH` | models/barronllm.gguf | AlphaLLM GGUF model file |
 | `DATABASE_URL` | postgresql+psycopg2://alphaweb:alphaweb@localhost:5432/alphaweb | SQLAlchemy connection string |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | alphaweb / alphaweb | DB credentials (used to build DATABASE_URL) |
@@ -724,20 +739,86 @@ Last Updated: 2026-04-26
 
 ## Quick Start (TL;DR)
 
+> **Windows users — read [Windows Gotchas](#windows-gotchas) first.** Ports 5432
+> and 8000 commonly clash on Windows. This Quick Start uses the ports that
+> actually work on a stock Windows box: **Postgres on 5444, backend on 8080.**
+
 ```bash
-# Backend
+# 1. Postgres (Docker) — host port 5444 to dodge any native Postgres on 5432/5433
 cd backend
+POSTGRES_HOST_PORT=5444 docker compose -f docker-compose.postgres.yml up -d
+
+# 2. backend/.env — point the backend at that container (IPv4, not localhost)
+#    POSTGRES_HOST=127.0.0.1
+#    POSTGRES_PORT=5444
+
+# 3. Backend deps + run on 8080 (port 8000 is reserved by Hyper-V on Windows)
 pip install -r requirements.txt
 pip install bandit
-docker compose -f docker-compose.postgres.yml up -d   # Postgres on :5432
-python -m uvicorn app:app --host 0.0.0.0 --port 8000
+python -m uvicorn app:app --host 0.0.0.0 --port 8080 --reload
 
-# Frontend (new terminal)
+# 4. Frontend (new terminal) — vite.config.js proxies /api -> http://localhost:8080
+cd ..
 npm install
 npm run dev
 
 # Visit
-# http://localhost:5173
+# http://localhost:5173   (backend health: http://localhost:8080/health)
 ```
 
 Upload a Python/JS file → Click "Analyze" → See vulnerabilities with line numbers, CWE codes, and actionable fixes.
+
+---
+
+## Windows Gotchas
+
+Three things bite on a stock Windows machine. All three are fixed in the Quick
+Start above; here is the *why* so you can debug if it breaks again.
+
+### 1. Port 8000 is reserved by Hyper-V / WSL
+`uvicorn ... --port 8000` fails with:
+```
+[Errno 13] error while attempting to bind on address ('0.0.0.0', 8000):
+an attempt was made to access a socket in a way forbidden by its access permissions
+```
+Hyper-V grabs port ranges for itself. Check with:
+```powershell
+netsh interface ipv4 show excludedportrange protocol=tcp
+```
+If `8000` falls inside an excluded range, **use 8080** (backend) and make sure
+`vite.config.js` proxies `/api` → `http://localhost:8080`.
+
+### 2. Native Postgres squats on 5432 (and 5433)
+If you have PostgreSQL installed as a Windows service, it owns 5432. The Docker
+container maps to the host but **connections silently hit the native Postgres**,
+giving:
+```
+psycopg2.OperationalError: ... password authentication failed for user "alphaweb"
+```
+Check who's listening:
+```powershell
+netstat -ano | findstr ":5432"        # find the PID
+Get-Service *postgres*                  # find the native service(s)
+```
+Fix: map the Docker container to a free port and point the backend at it:
+```bash
+POSTGRES_HOST_PORT=5444 docker compose -f docker-compose.postgres.yml up -d
+```
+Then in `backend/.env`: `POSTGRES_PORT=5444`.
+
+### 3. Use 127.0.0.1, not localhost, for the DB
+psycopg2 resolves `localhost` to IPv6 `::1` first; the Docker port map is IPv4
+only, so the connection lands on the wrong server (the native Postgres above) or
+times out. Force IPv4 in `backend/.env`:
+```
+POSTGRES_HOST=127.0.0.1
+```
+
+### Stale Postgres volume = wrong password
+If you changed `POSTGRES_PASSWORD` after first boot, the old creds persist in the
+`backend_pg_data` volume. Nuke it for a clean slate:
+```bash
+cd backend
+docker compose -f docker-compose.postgres.yml down -v   # -v drops the volume
+POSTGRES_HOST_PORT=5444 docker compose -f docker-compose.postgres.yml up -d
+```
