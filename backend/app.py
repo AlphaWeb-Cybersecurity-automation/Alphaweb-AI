@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from config import Settings
@@ -35,6 +35,18 @@ from services.report_builder import (
     save_report,
 )
 from services.pdf_builder import render_reports_pdf
+from services.system_profiler import build_profile
+from services.ownership import (
+    check_tool_access,
+    check_verification,
+    create_user,
+    denial_text,
+    get_or_create_challenge,
+    list_domains,
+    registrable_domain,
+    resolve_user_id,
+    revoke_domain,
+)
 from services.workflow_engine import WorkflowEngine
 from tool_runner import cancel_run, run_tool, run_tool_streaming
 from validators import (
@@ -240,6 +252,7 @@ async def _process_scan(job_id: str) -> None:
                     initial_tool=scan.tool_name,
                     initial_params=params,
                     initial_confidence=0.85,
+                    user_id=scan.user_id,
                 )
                 elapsed = time.time() - start_time
 
@@ -268,6 +281,7 @@ async def _process_scan(job_id: str) -> None:
                         tool_name=scan.tool_name,
                         params=params,
                         confidence=0.85,
+                        user_id=scan.user_id,
                     )
                     elapsed = time.time() - start_time
 
@@ -385,12 +399,91 @@ app.add_middleware(
 )
 
 
+# --- Identity ---
+
+def current_user_id(
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+) -> str:
+    """Resolve the caller from `Authorization: Bearer <token>` or `X-API-Key`."""
+    token = x_api_key
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    user_id = resolve_user_id(token, settings.AUTH_REQUIRED)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid API token")
+    return user_id
+
+
+class CreateUserRequest(BaseModel):
+    email: Optional[str] = Field(default=None, max_length=255)
+
+
+class DomainRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=2048)
+
+
+class VerifyDomainRequest(DomainRequest):
+    method: str
+
+
+def _domain_or_400(raw: str) -> str:
+    domain = registrable_domain(raw)
+    if domain is None:
+        raise HTTPException(status_code=400, detail="Could not derive a verifiable domain or IP from input")
+    return domain
+
+
 # --- Endpoints ---
 
-@app.post("/api/scan", response_model=ScanCreateResponse, status_code=201)
-async def create_scan(req: ScanRequest) -> Any:
-    user_id = "default-user"
+@app.get("/api/system")
+async def system_profile() -> Any:
+    """Cookbook view: detected hardware, local models, active choice, recommendation."""
+    return await asyncio.to_thread(build_profile, settings.LLM_MODELS_DIR, settings.LLM_MODEL, settings.LLM_HF_MODEL)
 
+
+@app.post("/api/users", status_code=201)
+async def create_user_endpoint(req: CreateUserRequest) -> Any:
+    """Create a user. The API token is returned once and cannot be recovered."""
+    try:
+        return await asyncio.to_thread(create_user, req.email)
+    except Exception as e:
+        raise HTTPException(status_code=409, detail="Could not create user (email already used?)") from e
+
+
+@app.post("/api/domains")
+async def request_domain_challenge(req: DomainRequest, user_id: str = Depends(current_user_id)) -> Any:
+    """Start (or fetch) the ownership challenge for a domain: token + 3 methods."""
+    domain = _domain_or_400(req.domain)
+    return await asyncio.to_thread(get_or_create_challenge, user_id, domain)
+
+
+@app.get("/api/domains")
+async def list_user_domains(user_id: str = Depends(current_user_id)) -> Any:
+    return {"domains": await asyncio.to_thread(list_domains, user_id)}
+
+
+@app.post("/api/domains/verify")
+async def verify_domain(req: VerifyDomainRequest, user_id: str = Depends(current_user_id)) -> Any:
+    domain = _domain_or_400(req.domain)
+    try:
+        return await asyncio.to_thread(check_verification, user_id, domain, req.method)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.delete("/api/domains/{domain}")
+async def revoke_user_domain(domain: str, user_id: str = Depends(current_user_id)) -> Any:
+    reg = _domain_or_400(domain)
+    if not await asyncio.to_thread(revoke_domain, user_id, reg):
+        raise HTTPException(status_code=404, detail="Domain not found")
+    return {"domain": reg, "status": "revoked"}
+
+
+@app.post("/api/scan", response_model=ScanCreateResponse, status_code=201)
+async def create_scan(req: ScanRequest, user_id: str = Depends(current_user_id)) -> Any:
     # Rate limit check
     rate_check = check_rate_limit(user_id, settings.MAX_CONCURRENT_SCANS, settings.SCANS_PER_HOUR_LIMIT)
     if not rate_check.valid:
@@ -421,6 +514,11 @@ async def create_scan(req: ScanRequest) -> Any:
             "error": "Could not determine appropriate tool",
             "rationale": analysis.get("rationale", ""),
         })
+
+    # Ownership gate: Tier-2 tools need a verified domain (Tier 1 passes).
+    denial = await asyncio.to_thread(check_tool_access, user_id, tool_selected, req.target)
+    if denial:
+        raise HTTPException(status_code=403, detail=denial)
 
     # Sanitize LLM-generated parameters before validation
     params = analysis.get("parameters", {})
@@ -868,7 +966,7 @@ _cancelled_runs: set = set()
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> Any:
+async def chat(req: ChatRequest, user_id: str = Depends(current_user_id)) -> Any:
     """Non-streaming fallback — kept for compatibility. Prefer /chat/stream."""
     target = req.domain.strip()
     run_id = req.run_id or uuid.uuid4().hex
@@ -887,6 +985,9 @@ async def chat(req: ChatRequest) -> Any:
         input_err = precheck_tool_input(tool_name, {})
         if input_err:
             return tool_name, "", input_err, -1, 0.0
+        denial = await asyncio.to_thread(check_tool_access, user_id, tool_name, target)
+        if denial:
+            return tool_name, "", denial_text(denial), -1, 0.0
         args, run_target = _resolve_chat_invocation(tool_name, target, req.tool_args)
         try:
             result = await run_tool(
@@ -963,7 +1064,7 @@ async def chat(req: ChatRequest) -> Any:
 
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, user_id: str = Depends(current_user_id)):
     """
     SSE streaming endpoint.
     Events:
@@ -1023,6 +1124,22 @@ async def chat_stream(req: ChatRequest):
                 })
                 combined_raw += f"\n=== {tool_name.upper()} ERROR ===\n{input_err}\n"
                 yield f'data: {json.dumps({"type": "tool_line", "tool": tool_name, "line": f"[ERROR] {input_err}"})}\n\n'
+                yield f'data: {json.dumps({"type": "tool_done", "tool": tool_name, "exit_code": -1})}\n\n'
+                continue
+
+            # Ownership gate: Tier-2 tools need a verified domain (Tier 1 passes).
+            denial = await asyncio.to_thread(check_tool_access, user_id, tool_name, target)
+            if denial:
+                denial_msg = denial_text(denial)
+                yield f'data: {json.dumps({"type": "tool_start", "tool": tool_name})}\n\n'
+                tool_errors.append(f"{tool_name}: {denial_msg}")
+                tools_used.append(tool_name)
+                tool_results.append({
+                    "tool": tool_name, "raw_output": "", "error": denial_msg,
+                    "exit_code": -1, "duration": 0.0,
+                })
+                combined_raw += f"\n=== {tool_name.upper()} ERROR ===\n{denial_msg}\n"
+                yield f'data: {json.dumps({"type": "tool_line", "tool": tool_name, "line": f"[OWNERSHIP] {denial_msg}"})}\n\n'
                 yield f'data: {json.dumps({"type": "tool_done", "tool": tool_name, "exit_code": -1})}\n\n'
                 continue
 
@@ -1317,12 +1434,16 @@ async def reset_database() -> Any:
 # --- Legacy endpoint ---
 
 @app.post("/execute", response_model=ExecuteResponse)
-async def execute(req: ExecuteRequest) -> Any:
+async def execute(req: ExecuteRequest, user_id: str = Depends(current_user_id)) -> Any:
     start = time.time()
     request_id = os.urandom(8).hex()
 
     try:
         validated = parse_and_validate_execute_request(req)
+
+        denial = await asyncio.to_thread(check_tool_access, user_id, validated.tool, validated.target)
+        if denial:
+            raise HTTPException(status_code=403, detail=denial)
 
         # Sanitise the optional run_id so a cancel request can target it.
         safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "", req.run_id or "")[:64] or None
@@ -1356,6 +1477,8 @@ async def execute(req: ExecuteRequest) -> Any:
             raw_output=run_result.raw_output[: settings.TOOL_OUTPUT_MAX_CHARS],
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Execution failed")
         raise HTTPException(status_code=500, detail=str(e)) from e

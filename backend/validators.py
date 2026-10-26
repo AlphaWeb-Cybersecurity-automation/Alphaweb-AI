@@ -9,34 +9,11 @@ from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tool_tiers import TOOL_TIERS
 
-SUPPORTED_TOOLS = [
-    "nmap",
-    "masscan",
-    "nikto",
-    "sqlmap",
-    "ffuf",
-    "gobuster",
-    "john",
-    "hydra",
-    "curl",
-    "tcpdump",
-    "nuclei",
-    "hashcat",
-    "gitleaks",
-    "theharvester",
-    "subfinder",
-    "testssl",
-    "wapiti",
-    "wpscan",
-    "cewl",
-    "trivy",
-    "amass",
-    "commix",
-    "searchsploit",
-    "subdominator",
-    "httpx",
-]
+
+# Derived from tool_tiers.TOOL_TIERS (single source of truth for the catalog).
+SUPPORTED_TOOLS = list(TOOL_TIERS)
 
 # --- Pydantic models for the legacy /execute endpoint ---
 

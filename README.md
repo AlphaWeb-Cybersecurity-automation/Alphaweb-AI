@@ -125,7 +125,7 @@ pip install -r requirements.txt
 - `sqlalchemy` — ORM
 - `psycopg2-binary` — PostgreSQL driver
 - `reportlab` — PDF report generation
-- `llama-cpp-python` — AlphaLLM inference (local GGUF model via llama-server.exe)
+- AlphaLLM inference needs no Python package here: it talks HTTP to llama-server (GGUF) or `backend/hf_server.py` (see the cookbook section)
 - `bandit` — Python security linter
 - `semgrep` — SAST scanner (Windows encoding issues; pattern fallback used)
 
@@ -136,8 +136,10 @@ Create a `.env` file or export:
 ORCHESTRATOR_HOST=0.0.0.0
 ORCHESTRATOR_PORT=8000
 
-# AlphaLLM model
-BARONLLM_MODEL_PATH=models/barronllm.gguf
+# AlphaLLM model: "auto" (default) = cookbook picks the best local model for this hardware,
+# or a name from backend/model_catalog.py (qwen2.5-7b-instruct, mistral-7b-instruct-v0.3, ...)
+LLM_MODEL=auto
+# BARONLLM_MODEL_PATH=models/custom.gguf   # optional explicit path, overrides LLM_MODEL
 BARONLLM_N_CTX=4096
 BARONLLM_N_GPU_LAYERS=35
 BARONLLM_TEMPERATURE=0.1
@@ -184,7 +186,16 @@ python -c "from database import init_db; init_db()"
 ```
 
 #### 4. Download AlphaLLM Model
-Place your GGUF model at `backend/models/barronllm.gguf`. Also requires `binaries/llama-server.exe` in the project root. Graceful fallback to keyword-based tool selection if model unavailable.
+Run the cookbook from `backend/`:
+
+```bash
+python -m services.system_profiler              # detect hardware, find local models, recommend
+python -m services.system_profiler --download   # fetch the recommended GGUF into backend/models/
+```
+
+It detects RAM/GPU/VRAM, then looks for models you already have (in `backend/models/`, the Hugging Face cache, and Ollama's store, whose blobs are plain GGUFs) and uses the best one that fits. If none fits it recommends a download. The same report is at `GET /api/system`. Only GGUF files work: Hugging Face safetensors / bitsandbytes (`*-bnb-4bit`) exports are flagged as unusable. Pin a model with `LLM_MODEL=<name>`, or point `BARONLLM_MODEL_PATH` at any GGUF.
+
+**Using a Hugging Face model instead (no llama.cpp):** set `LLM_HF_MODEL=<repo id or local dir>` in `backend/.env` (e.g. `unsloth/mistral-7b-v0.3-bnb-4bit`). The backend then starts `backend/hf_server.py` from the virtualenv at `<project root>/.venv-hf` (see `backend/requirements-hf.txt` for setup; override the interpreter with `LLM_HF_PYTHON`). It serves the same API on port 8081 with the same schema-constrained decoding, via lm-format-enforcer. Pre-quantized bitsandbytes checkpoints load as-is; full-precision ones are quantized to 4-bit on load. Base (non-instruct) models work but select tools poorly; prefer an `-Instruct` model. Also requires `binaries/llama-server.exe` in the project root. Graceful fallback to keyword-based tool selection if model unavailable.
 
 #### 5. Start Backend
 ```bash
@@ -634,7 +645,9 @@ cd backend && docker compose -f docker-compose.postgres.yml ps
 |----------|---------|---------|
 | `ORCHESTRATOR_HOST` | 0.0.0.0 | FastAPI bind address |
 | `ORCHESTRATOR_PORT` | 8000 | FastAPI port |
-| `BARONLLM_MODEL_PATH` | models/barronllm.gguf | AlphaLLM GGUF model file |
+| `LLM_MODEL` | auto | `auto` (cookbook picks from local models) or a name in `backend/model_catalog.py` |
+| `LLM_MODELS_DIR` | models | Directory holding GGUF files (cookbook also checks the HF cache and Ollama) |
+| `BARONLLM_MODEL_PATH` | (derived from `LLM_MODEL`) | Explicit GGUF path; overrides `LLM_MODEL` |
 | `DATABASE_URL` | postgresql+psycopg2://alphaweb:alphaweb@localhost:5432/alphaweb | SQLAlchemy connection string |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | alphaweb / alphaweb | DB credentials (used to build DATABASE_URL) |
 | `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` | localhost / 5432 / alphaweb | DB host, port, name |

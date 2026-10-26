@@ -28,7 +28,8 @@ services:
       - LOG_DIR=/app/logs
       - LOG_FILE=/app/logs/orchestrator.log
       - LOG_LEVEL=INFO
-      - BARONLLM_MODEL_PATH=/app/models/baronllm-llama3.1-v1-q6_k.gguf
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5-7b-instruct}
+      - LLM_MODELS_DIR=/app/models
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-alphaweb}:${POSTGRES_PASSWORD:-alphaweb}@db:5432/${POSTGRES_DB:-alphaweb}
       - HOST_DATA_DIR=volume:john_data
       - JOHN_LOCAL_DATA_DIR=/app/data

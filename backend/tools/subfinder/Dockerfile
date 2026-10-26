@@ -1,5 +1,5 @@
 
-FROM golang:1.24-alpine AS build
+FROM golang:alpine AS build
 RUN apk add --no-cache git \
     && go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 

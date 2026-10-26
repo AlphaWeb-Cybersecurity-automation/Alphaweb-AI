@@ -8,6 +8,7 @@ Flow:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -18,6 +19,7 @@ from tool_runner import ToolRunResult, run_tool
 
 from services.anomaly_detector import detect_anomalies
 from services.execution_graph import ExecutionGraph
+from services.ownership import check_tool_access, denial_text
 from services.tool_decision_engine import decide_next_tools
 from services.workflow_engine import WorkflowEngine
 
@@ -37,6 +39,7 @@ class ShannonOrchestrator:
         initial_tool: str,
         initial_params: Dict[str, Any],
         initial_confidence: float,
+        user_id: str,
     ) -> Dict[str, Any]:
         """Execute the full orchestration workflow.
 
@@ -56,6 +59,7 @@ class ShannonOrchestrator:
             graph=graph,
             workflow=workflow,
             target=target,
+            user_id=user_id,
             tool_name=initial_tool,
             parameters=initial_params,
             confidence=initial_confidence,
@@ -80,6 +84,7 @@ class ShannonOrchestrator:
         graph: ExecutionGraph,
         workflow: WorkflowEngine,
         target: str,
+        user_id: str,
         tool_name: str,
         parameters: Dict[str, Any],
         confidence: float,
@@ -120,6 +125,13 @@ class ShannonOrchestrator:
         if input_err:
             logger.info(f"Tool {tool_name} skipped: {input_err}")
             workflow.fail_step(step_id, input_err)
+            return
+
+        # Ownership gate: a chain can move from a Tier-1 tool to a Tier-2 one.
+        denial = await asyncio.to_thread(check_tool_access, user_id, tool_name, target)
+        if denial:
+            logger.info(f"Tool {tool_name} blocked: {denial['error']}")
+            workflow.fail_step(step_id, denial_text(denial))
             return
 
         # Build args string from parameters
@@ -176,6 +188,7 @@ class ShannonOrchestrator:
                 graph=graph,
                 workflow=workflow,
                 target=target,
+                user_id=user_id,
                 tool_name=next_tool_info["tool"],
                 parameters=next_tool_info.get("parameters", {}),
                 confidence=confidence * 0.95,  # slight decay per chain depth
@@ -191,6 +204,7 @@ class ShannonOrchestrator:
         tool_name: str,
         params: Dict[str, Any],
         confidence: float,
+        user_id: str,
     ) -> Dict[str, Any]:
         """Fallback: run a single tool without chaining (Phase 1 behavior)."""
         workflow = WorkflowEngine(scan_id)
@@ -206,6 +220,18 @@ class ShannonOrchestrator:
             return {
                 "findings": [],
                 "raw_output": input_err,
+                "execution_time": 0.0,
+                "exit_code": -1,
+                "status": "failed",
+            }
+
+        denial = await asyncio.to_thread(check_tool_access, user_id, tool_name, target)
+        if denial:
+            msg = denial_text(denial)
+            workflow.fail_step(step_id, msg)
+            return {
+                "findings": [],
+                "raw_output": msg,
                 "execution_time": 0.0,
                 "exit_code": -1,
                 "status": "failed",

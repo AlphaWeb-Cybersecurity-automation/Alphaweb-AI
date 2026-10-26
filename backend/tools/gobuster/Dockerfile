@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine AS build
+FROM golang:alpine AS build
 
 RUN apk add --no-cache git
 RUN go install github.com/OJ/gobuster/v3@latest

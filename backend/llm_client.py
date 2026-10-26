@@ -44,6 +44,23 @@ TOOL_DESCRIPTIONS = {
 
 AVAILABLE_TOOLS = list(TOOL_DESCRIPTIONS.keys())
 
+# Grammar-enforced schema for tool selection. tool_selected is an ENUM of the
+# real tool names (+ null), so the decoder cannot hallucinate a tool.
+TOOL_SELECTION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "tool_selected": {"enum": AVAILABLE_TOOLS + [None]},
+        "confidence":    {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "parameters":    {"type": "object"},
+        "rationale":     {"type": "string"},
+        "safety_checks_passed": {"type": "boolean"},
+        "warnings":      {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["tool_selected", "confidence", "parameters",
+                 "rationale", "safety_checks_passed", "warnings"],
+}
+
 # Pre-built at module load — avoids rebuilding on every analyze() call
 _TOOLS_LIST_STR: str = "\n".join(f"- {k}: {v}" for k, v in TOOL_DESCRIPTIONS.items())
 
@@ -92,7 +109,8 @@ USER_PROMPT_TEMPLATE = "target={target}\nrequest={request}"
 # Path to llama-server.exe — in binaries/ next to project root
 LLAMA_SERVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "binaries"))
 LLAMA_SERVER_EXE = os.path.join(LLAMA_SERVER_DIR, "llama-server.exe")
-LLAMA_SERVER_URL = "http://127.0.0.1:8081"
+LLAMA_SERVER_URL = "http://127.0.0.1:8081"  # llama-server and hf_server.py both listen here
+HF_SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_server.py")
 
 _CODE_TRUNCATE_LIMIT = 4000
 
@@ -475,6 +493,8 @@ class BaronLLM:
         self._loaded = False
         self._server_proc: Optional[subprocess.Popen] = None
         self._load_lock = threading.Lock()
+        # llama-server `usage` dict from the most recent _chat call (eval cost metric).
+        self.last_usage: Optional[Dict[str, Any]] = None
 
     def ensure_loaded(self) -> bool:
         """Lazy-load the model on first use. Thread-safe; idempotent.
@@ -495,18 +515,27 @@ class BaronLLM:
         Cheap check — does not start the server. Used by /health so a sleeping
         (not-yet-loaded) Baron still reports healthy.
         """
+        if self._settings.LLM_HF_MODEL:
+            return os.path.isfile(self._settings.LLM_HF_PYTHON) and os.path.isfile(HF_SERVER_SCRIPT)
         model_path = os.path.abspath(self._settings.BARONLLM_MODEL_PATH)
         return os.path.isfile(model_path) and os.path.isfile(LLAMA_SERVER_EXE)
 
     def load(self) -> bool:
-        model_path = os.path.abspath(self._settings.BARONLLM_MODEL_PATH)
-        if not os.path.isfile(model_path):
-            logger.error(f"AlphaLLM model file not found: {model_path}")
-            return False
+        use_hf = bool(self._settings.LLM_HF_MODEL)
+        if use_hf:
+            if not (os.path.isfile(self._settings.LLM_HF_PYTHON) and os.path.isfile(HF_SERVER_SCRIPT)):
+                logger.error(f"HF model server unavailable: need {self._settings.LLM_HF_PYTHON} "
+                             f"(virtualenv with torch/transformers/bitsandbytes) and {HF_SERVER_SCRIPT}")
+                return False
+        else:
+            model_path = os.path.abspath(self._settings.BARONLLM_MODEL_PATH)
+            if not os.path.isfile(model_path):
+                logger.error(f"AlphaLLM model file not found: {model_path}")
+                return False
 
-        if not os.path.isfile(LLAMA_SERVER_EXE):
-            logger.error(f"llama-server.exe not found: {LLAMA_SERVER_EXE}")
-            return False
+            if not os.path.isfile(LLAMA_SERVER_EXE):
+                logger.error(f"llama-server.exe not found: {LLAMA_SERVER_EXE}")
+                return False
 
         if self._is_server_healthy():
             logger.info("AlphaLLM server already running")
@@ -514,27 +543,33 @@ class BaronLLM:
             return True
 
         try:
-            cmd = [
-                LLAMA_SERVER_EXE,
-                "-m", model_path,
-                "--host", "127.0.0.1",
-                "--port", "8081",
-                "-ngl", str(self._settings.BARONLLM_N_GPU_LAYERS or 35),
-                "-c", str(self._settings.BARONLLM_N_CTX),
-            ]
+            if use_hf:
+                cmd = [self._settings.LLM_HF_PYTHON, HF_SERVER_SCRIPT,
+                       "--model", self._settings.LLM_HF_MODEL, "--port", "8081"]
+                # Log to a file: a full stderr pipe would stall the server mid-load.
+                os.makedirs(self._settings.LOG_DIR, exist_ok=True)
+                server_log = open(os.path.join(self._settings.LOG_DIR, "hf_server.log"), "ab")
+                popen_kwargs: Dict[str, Any] = {"stdout": server_log, "stderr": server_log,
+                                                "cwd": os.path.dirname(HF_SERVER_SCRIPT)}
+                budget = 300.0  # first start loads multi-GB weights and initialises CUDA
+            else:
+                cmd = [
+                    LLAMA_SERVER_EXE,
+                    "-m", model_path,
+                    "--host", "127.0.0.1",
+                    "--port", "8081",
+                    "-ngl", str(self._settings.BARONLLM_N_GPU_LAYERS or 35),
+                    "-c", str(self._settings.BARONLLM_N_CTX),
+                ]
+                popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": LLAMA_SERVER_DIR}
+                budget = 60.0
             logger.info(f"Starting AlphaLLM server: {' '.join(cmd)}")
 
-            self._server_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=LLAMA_SERVER_DIR,
-            )
+            self._server_proc = subprocess.Popen(cmd, **popen_kwargs)
 
-            # Exponential backoff: 1s, 2s, 4s, 8s... capped at 16s, total ~60s budget
+            # Exponential backoff: 1s, 2s, 4s, 8s... capped at 16s
             delay = 1.0
             elapsed = 0.0
-            budget = 60.0
             while elapsed < budget:
                 time.sleep(delay)
                 elapsed += delay
@@ -543,12 +578,15 @@ class BaronLLM:
                     logger.info(f"AlphaLLM server started and healthy (waited {elapsed:.0f}s)")
                     return True
                 if self._server_proc.poll() is not None:
-                    stderr = self._server_proc.stderr.read().decode(errors="replace")
-                    logger.error(f"AlphaLLM server exited: {stderr[:500]}")
+                    if self._server_proc.stderr is not None:
+                        stderr = self._server_proc.stderr.read().decode(errors="replace")
+                        logger.error(f"AlphaLLM server exited: {stderr[:500]}")
+                    else:
+                        logger.error("AlphaLLM server exited; see hf_server.log in the log dir")
                     return False
                 delay = min(delay * 2, 16.0)
 
-            logger.error("AlphaLLM server did not become healthy within 60s")
+            logger.error(f"AlphaLLM server did not become healthy within {budget:.0f}s")
             return False
 
         except Exception as e:
@@ -565,8 +603,12 @@ class BaronLLM:
         except Exception:
             return False
 
-    def _chat(self, messages: List[Dict], temperature: float = 0.1, max_tokens: int = 512, json_mode: bool = True) -> str:
-        """Send chat completion request to llama-server. Raises LLMError on failure."""
+    def _chat(self, messages: List[Dict], temperature: float = 0.1, max_tokens: int = 512, json_mode: bool = True,
+              schema: Optional[Dict[str, Any]] = None, seed: Optional[int] = None) -> str:
+        """Send chat completion request to llama-server. Raises LLMError on failure.
+
+        If `schema` is given, the decoder is grammar-constrained to it.
+        """
         payload_dict: Dict[str, Any] = {
             "messages": messages,
             "temperature": temperature,
@@ -574,8 +616,16 @@ class BaronLLM:
             "repeat_penalty": 1.3,
             "repeat_last_n": 64,
         }
-        if json_mode:
+        if schema is not None:
+            # Constrain the decoder to this schema (grammar-enforced).
+            payload_dict["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "schema", "schema": schema, "strict": True},
+            }
+        elif json_mode:
             payload_dict["response_format"] = {"type": "json_object"}
+        if seed is not None:
+            payload_dict["seed"] = seed
         payload = json.dumps(payload_dict).encode()
 
         req = urllib.request.Request(
@@ -587,6 +637,7 @@ class BaronLLM:
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read())
+                self.last_usage = data.get("usage")
                 return data["choices"][0]["message"]["content"]
         except urllib.error.URLError as e:
             raise LLMError(f"HTTP request to llama-server failed: {e}") from e
@@ -640,7 +691,10 @@ class BaronLLM:
             "warnings": [reason],
         }
 
-    def analyze(self, user_request: str, target: str) -> Dict[str, Any]:
+    def analyze(self, user_request: str, target: str, constrained: bool = True,
+                seed: Optional[int] = None) -> Dict[str, Any]:
+        """Pick a tool. `constrained=False` skips the schema grammar (json_object
+        mode only) so the eval can ablate constrained vs free-text decoding."""
         if not self._loaded:
             return self._error_response("AlphaLLM model is not loaded")
 
@@ -654,6 +708,8 @@ class BaronLLM:
                 ],
                 temperature=self._settings.BARONLLM_TEMPERATURE,
                 max_tokens=512,
+                schema=TOOL_SELECTION_SCHEMA if constrained else None,
+                seed=seed,
             )
 
             result = self._parse_response(raw_text)

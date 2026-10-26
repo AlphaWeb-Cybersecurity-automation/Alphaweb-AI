@@ -4,6 +4,7 @@ pydantic
 sqlalchemy
 psycopg2-binary
 reportlab
-llama-cpp-python
 sentence-transformers
 numpy
+dnspython
+tldextract

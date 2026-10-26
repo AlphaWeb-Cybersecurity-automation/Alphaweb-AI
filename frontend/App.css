@@ -61,12 +61,12 @@
   align-items: center;
   gap: 8px;
   padding: 8px 18px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   font-family: var(--font-mono);
   font-size: 12px;
   z-index: 9999;
   white-space: nowrap;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.55);
+  box-shadow: var(--shadow-md);
   animation: toast-in 0.2s ease;
   pointer-events: none;
 }

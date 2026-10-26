@@ -44,6 +44,16 @@
   /* Fonts */
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
   --font-ui:   'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+
+  /* Shape, depth, motion */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 24px rgba(0, 0, 0, 0.55);
+  --ease: 0.15s ease;
+
+  color-scheme: dark;
 }
 
 /* ── Light theme ─────────────────────────────────────── */
@@ -76,6 +86,11 @@
 
   --border:        #d0d7de;
   --border-bright: #b6bec6;
+
+  --shadow-sm: 0 1px 2px rgba(27, 31, 36, 0.12);
+  --shadow-md: 0 4px 24px rgba(27, 31, 36, 0.18);
+
+  color-scheme: light;
 }
 
 html, body, #root {
@@ -95,12 +110,43 @@ body {
 }
 
 /* Scrollbars */
-::-webkit-scrollbar       { width: 5px; height: 5px; }
+::-webkit-scrollbar       { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+::-webkit-scrollbar-thumb {
+  background: var(--border-bright);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); background-clip: padding-box; border: 2px solid transparent; }
+* { scrollbar-width: thin; scrollbar-color: var(--border-bright) transparent; }
 
 /* Selection */
 ::selection { background: var(--cyan-glow); color: var(--cyan); }
 
 button { font-family: inherit; }
+
+/* Keyboard focus ring for buttons and links (text inputs keep their own styling) */
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+[tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
+}
+
+/* Smooth hover/active feedback on interactive controls */
+button, a, [role="button"] {
+  transition: background-color var(--ease), color var(--ease),
+              border-color var(--ease), box-shadow var(--ease), opacity var(--ease);
+}
+
+button:disabled { cursor: not-allowed; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

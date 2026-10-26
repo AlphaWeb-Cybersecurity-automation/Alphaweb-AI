@@ -10,6 +10,7 @@ node_modules/
 __pycache__/
 *.pyc
 venv/
+.venv/
 env/
 
 .COMPREHENSIVE_PROJECT_REPORT.md
@@ -37,3 +38,18 @@ models/
 *.db
 *.sqlite
 *.sqlite3
+# Hugging Face model-server virtualenv (see backend/hf_server.py)
+.venv-hf/
+
+# Model weights, wherever they end up (models/ above only covers that folder)
+*.gguf
+*.safetensors
+
+# Benchmark output (eval/run.py). Exploratory runs shouldn't be committed by accident;
+# `git add -f` the ones you publish.
+eval/results/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

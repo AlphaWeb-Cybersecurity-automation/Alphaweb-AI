@@ -1,0 +1,13 @@
+# Hugging Face model server (backend/hf_server.py). Install into its OWN virtualenv:
+#   python -m venv .venv-hf
+#   .venv-hf/Scripts/python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   .venv-hf/Scripts/python -m pip install -r backend/requirements-hf.txt
+# (cu128 build is required for RTX 50-series / Blackwell GPUs; use cu124 or cpu elsewhere.)
+transformers<5          # lm-format-enforcer 0.11 imports modules removed in transformers 5
+accelerate
+bitsandbytes
+lm-format-enforcer
+protobuf                # tokenizer conversion
+sentencepiece
+fastapi
+uvicorn[standard]

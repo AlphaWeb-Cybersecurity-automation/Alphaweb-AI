@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from dotenv import load_dotenv
+
+from model_catalog import CATALOG_BY_NAME, DEFAULT_MODEL
+from services.system_profiler import hf_venv_python
 
 # Load backend/.env (next to this file) before settings are read.
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -12,6 +15,38 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 def env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
+
+
+def resolve_llm_model(requested: str, models_dir: str, explicit_path: str) -> Tuple[str, str, str]:
+    """Return (active model name, GGUF path, HF model id) for the Layer-2 LLM.
+
+    Exactly one of GGUF path / HF model id is set (the other is ""). explicit_path
+    (BARONLLM_MODEL_PATH) wins. Otherwise `requested` is a model_catalog name, or
+    "auto" to let the cookbook (services.system_profiler) pick the best model
+    already on disk that this hardware and the installed runtimes can run. If
+    nothing usable is found the default model is returned; load() then reports
+    what is missing and the cookbook says what to download.
+    """
+    if explicit_path:
+        return (requested if requested != "auto" else os.path.basename(explicit_path)), explicit_path, ""
+    if requested != "auto" and requested not in CATALOG_BY_NAME:
+        raise ValueError(
+            f"Unknown LLM_MODEL {requested!r}; choose 'auto' or one of {sorted(CATALOG_BY_NAME)}, "
+            "or set BARONLLM_MODEL_PATH explicitly"
+        )
+    try:
+        from services.system_profiler import choose_local_model, detect_hardware, discover_local_models
+
+        chosen = choose_local_model(detect_hardware(), discover_local_models(models_dir), requested)
+        if chosen:
+            name = chosen.catalog.name if chosen.catalog else chosen.label
+            return (name, "", chosen.label) if chosen.backend == "hf" else (name, chosen.path, "")
+    except Exception:  # noqa: BLE001 - never block startup on hardware probing
+        pass
+    spec = CATALOG_BY_NAME[requested if requested != "auto" else DEFAULT_MODEL]
+    if spec.backend == "hf":
+        return spec.name, "", spec.repo or ""
+    return spec.name, os.path.join(models_dir, spec.file), ""
 
 
 class Settings:
@@ -32,8 +67,27 @@ class Settings:
     # Selection below this confidence falls back to keyword detection.
     GEMMA_CONFIDENCE_THRESHOLD: float = float(env("GEMMA_CONFIDENCE_THRESHOLD", "0.5"))
 
-    # BaronLLM
-    BARONLLM_MODEL_PATH: str = env("BARONLLM_MODEL_PATH", "models/barronllm.gguf")
+    # Layer 2 model (served by llama-server).
+    # LLM_MODEL=auto (default): the cookbook picks the best model already on disk
+    # (models dir, Hugging Face cache, Ollama) that fits this machine's memory.
+    # Or name one from model_catalog.py. BARONLLM_MODEL_PATH overrides everything
+    # with an explicit GGUF path. (Setting names keep the BARONLLM_ prefix for
+    # compatibility; they apply to whichever model is active.)
+    LLM_MODEL: str = env("LLM_MODEL", "auto")
+    LLM_MODELS_DIR: str = env("LLM_MODELS_DIR", "models")
+    LLM_MODEL_ACTIVE, BARONLLM_MODEL_PATH, _RESOLVED_HF_MODEL = resolve_llm_model(
+        LLM_MODEL, LLM_MODELS_DIR, env("BARONLLM_MODEL_PATH")
+    )
+
+    # Hugging Face backend (backend/hf_server.py) instead of llama-server + GGUF.
+    # Chosen automatically by LLM_MODEL (auto / an "-hf" catalog name), or force any
+    # HF repo id or local dir with LLM_HF_MODEL (e.g. unsloth/mistral-7b-v0.3-bnb-4bit).
+    # It runs in its own virtualenv (default <project root>/.venv-hf) with torch,
+    # transformers and bitsandbytes installed.
+    LLM_HF_MODEL: str = env("LLM_HF_MODEL") or _RESOLVED_HF_MODEL
+    LLM_HF_PYTHON: str = env("LLM_HF_PYTHON") or hf_venv_python()
+    if LLM_HF_MODEL:
+        LLM_MODEL_ACTIVE = LLM_HF_MODEL
     BARONLLM_N_CTX: int = int(env("BARONLLM_N_CTX", "4096"))
     # BaronLLM (Layer 2, summary) runs on GPU — it is the big cybersec-tuned
     # model and benefits most from acceleration. Layer 1 routing (llama3.2)
@@ -41,6 +95,15 @@ class Settings:
     BARONLLM_N_GPU_LAYERS: int = int(env("BARONLLM_N_GPU_LAYERS", "35"))
     BARONLLM_TEMPERATURE: float = float(env("BARONLLM_TEMPERATURE", "0.1"))
     BARONLLM_CONFIDENCE_THRESHOLD: float = float(env("BARONLLM_CONFIDENCE_THRESHOLD", "0.7"))
+
+    # Identity / authorization
+    # AUTH_REQUIRED=false: requests with no API token run as the built-in
+    # "default-user" (local single-user use). A token that is sent but invalid
+    # is always rejected. Set true to require a token on every request.
+    AUTH_REQUIRED: bool = env("AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
+    # "enforce": Tier-2 tools only run against domains the user has verified.
+    # "off": skip the ownership gate (local lab use only).
+    OWNERSHIP_ENFORCEMENT: str = env("OWNERSHIP_ENFORCEMENT", "enforce").lower()
 
     # Database
     # PostgreSQL by default. Override DATABASE_URL to point elsewhere (e.g. a
